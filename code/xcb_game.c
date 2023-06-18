@@ -1,8 +1,12 @@
+// NOTE(Zourt): Using xlib for events because xcb events has a bug or it's not working how I expect, I don't know
+
 #include<stdio.h>
 #include<string.h>
 #include<stdlib.h>
 #include<stdint.h>
 #include<stdbool.h>
+
+#include<sys/mman.h>
 
 #include<X11/Xlib.h>
 #include<X11/Xlib-xcb.h>
@@ -10,6 +14,8 @@
 
 #include<xcb/xcb.h>
 #include<xcb/xcb_icccm.h>
+#include<xcb/xcb_image.h>
+#include<xcb/xcb_keysyms.h>
 
 
 typedef uint8_t u8;
@@ -29,7 +35,7 @@ typedef bool b32;
 
 global_variable b32 global_running;
 
-typedef struct XcbContext
+typedef struct X11Context
 {
     Display *display;
     xcb_connection_t *connection;
@@ -40,45 +46,125 @@ typedef struct XcbContext
     xcb_atom_t wm_delete_window;
 
     u32 window;
-}XcbContext;
+}X11Context;
 
-internal void xcb_handle_events(XcbContext *context, XEvent *event)
+typedef struct X11OffScreenBuffer
 {
-    XNextEvent(context->display, event);
+    xcb_image_t *image;
+    xcb_pixmap_t pixmap;
+    xcb_gcontext_t graphics_context;
 
+    u32 width;
+    u32 height;
+    u32 pitch;
+    void *memory;
+
+}X11OffScreenBuffer;
+
+global_variable X11OffScreenBuffer global_back_buffer;
+
+internal void x11_update_window(X11Context *context, X11OffScreenBuffer buffer)
+{
+     xcb_copy_area(context->connection, 
+             buffer.pixmap, 
+             context->window, buffer.graphics_context, 
+             0, 0, 0, 0,
+             buffer.width, buffer.height);
+}
+
+internal void x11_resize_back_buffer(X11Context *context, X11OffScreenBuffer *buffer, u32 width, u32 height)
+{
+    int bytes_per_pixel = 4;
+    if(buffer->memory)
+    {
+        // NOTE:(zourt) for some reason this (munmap) dumps when window is resized
+        // NOTE:(zourt) if application core dumps, this may be a culprit
+        munmap(buffer->memory, (buffer->width * buffer->height) * bytes_per_pixel);
+    }
+
+    if(buffer->pixmap)
+    {
+        xcb_free_pixmap(context->connection, buffer->pixmap);
+    }
+
+    if(buffer->graphics_context)
+    {
+        xcb_free_gc(context->connection, buffer->graphics_context);
+    }
+
+    buffer->width = width;
+    buffer->height = height;
+
+    // NOTE(Zourt): 24 is the pixmap depth, i.e rgb each with 8 bits
+    buffer->pixmap = xcb_generate_id(context->connection);
+    xcb_create_pixmap(context->connection, 24, buffer->pixmap, context->window, width, height);
+
+    buffer->graphics_context = xcb_generate_id(context->connection);
+    xcb_create_gc(context->connection, buffer->graphics_context, buffer->pixmap, 0, 0);
+
+
+    u8 pad = 32;
+    u8 depth = 24;
+    u8 bbp = 32;
+
+    buffer->pitch = width * bytes_per_pixel;
+    usize image_size = buffer->pitch * height;
+    void *image_data = mmap(0,
+            (width * height) * bytes_per_pixel,
+            PROT_READ | PROT_WRITE,
+            MAP_ANONYMOUS | MAP_PRIVATE,
+            -1,
+            0);
+
+    buffer->memory = image_data;
+
+    buffer->image = xcb_image_create(width, height, XCB_IMAGE_FORMAT_Z_PIXMAP, pad, depth, bbp, 0, 
+            (xcb_image_order_t)context->setup->image_byte_order, XCB_IMAGE_ORDER_LSB_FIRST, buffer->memory, image_size, (u8 *)buffer->memory);
+
+}
+
+internal bool x11_handle_events(X11Context *context, XEvent *event)
+{
+    bool should_quit = 0;
     switch(event->type)
     {
-        case(ClientMessage):
-        {
-            XClientMessageEvent *client_message_event = (XClientMessageEvent *)&event;
-
-            if(client_message_event->message_type == context->wm_protocols)
-            {
-                if(client_message_event->data.l[0] == context->wm_delete_window)
-                {
-                    fprintf(stdout, "Close Window\n");
-                    global_running = 0;
-                }
-            }
-        }break;
-
         case(KeyPress):
         case(KeyRelease):
         {
-            XKeyEvent *e = (XKeyEvent *)&event;
-            b32 is_down = (event->type == KeyPress);
+            bool is_down = (event->type == KeyPress);
+            XKeyEvent *e = (XKeyEvent *)event;
             KeySym keysym = XLookupKeysym(e, 0);
+            // xcb_key_press_event_t *e = (xcb_key_press_event_t *)event;
+            // xcb_keysym_t keysym = xcb_key_press_lookup_keysym(context->ksm, e, 0);
 
-            u32 modifiers = event->xkey.state;
-            if(keysym == XK_F4 || (keysym == XK_F4 && (modifiers & Mod1Mask)))
+            if(keysym == XK_F4 || (keysym == XK_F4 && (e->state & XCB_MOD_MASK_1)))
             {
-                global_running = 0;
+                should_quit = 1;
             }
         }break;
+
+        
+#if 1
+        case(Expose):
+        {
+            x11_update_window(context, global_back_buffer);
+        }break;
+
+        case(ResizeRequest):
+        {
+            XResizeRequestEvent *resize = (XResizeRequestEvent *)event;
+            u32 width = resize->width;
+            u32 height = resize->height;
+            printf("(width: %i, height: %i)\n", width, height);
+
+            x11_resize_back_buffer(context, &global_back_buffer,  width, height);
+        }break;
+#endif
     }
+    return should_quit;
 }
 
-internal void load_atoms(XcbContext *context)
+internal void load_atoms(X11Context *context)
 {
     xcb_intern_atom_cookie_t wm_delete_window_cookie = 
         xcb_intern_atom(context->connection, 0, strlen("WM_DELETE_WINDOW"), "WM_DELETE_WINDOW");
@@ -99,7 +185,7 @@ internal void load_atoms(XcbContext *context)
 
 int main(int argc, char **argv)
 {
-    XcbContext context = {};
+    X11Context context = {};
     int default_screen;
 
     context.display = XOpenDisplay(NULL);
@@ -110,7 +196,6 @@ int main(int argc, char **argv)
         if(context.connection)
         {
             default_screen = DefaultScreen(context.display);
-
             load_atoms(&context);
 
             context.setup = xcb_get_setup(context.connection);
@@ -129,6 +214,7 @@ int main(int argc, char **argv)
                     | XCB_EVENT_MASK_BUTTON_PRESS
                     | XCB_EVENT_MASK_BUTTON_RELEASE
                     | XCB_EVENT_MASK_RESIZE_REDIRECT
+                    | XCB_EVENT_MASK_EXPOSURE
                     ,
             };
 
@@ -157,16 +243,20 @@ int main(int argc, char **argv)
             global_running = 1;
             while(global_running)
             {
-                XEvent event;
                 while(XPending(context.display))
                 {
-                    xcb_handle_events(&context, &event);
+                    XEvent event;
+                    XNextEvent(context.display, &event);
+                    if(x11_handle_events(&context, &event))
+                    {
+                        global_running = 0;
+                    }
                 }
             }
         }
         else
         {
-            fprintf(stderr, "Unable to open Connect to the X11 server\n");
+            fprintf(stderr, "Unable to Connect to the X11 server\n");
             exit(1);
         }
     }

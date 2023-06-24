@@ -1,12 +1,13 @@
 // NOTE(Zourt): Using xlib for events because xcb events has a bug or it's not working how I expect, I don't know
 
 #include<stdio.h>
-#include<string.h>
 #include<stdlib.h>
+#include<string.h>
 #include<stdint.h>
 #include<stdbool.h>
 
 #include<sys/mman.h>
+#include<sys/shm.h>
 
 #include<X11/Xlib.h>
 #include<X11/Xlib-xcb.h>
@@ -15,8 +16,7 @@
 #include<xcb/xcb.h>
 #include<xcb/xcb_icccm.h>
 #include<xcb/xcb_image.h>
-#include<xcb/xcb_keysyms.h>
-
+#include<xcb/shm.h>
 
 typedef uint8_t u8;
 typedef uint16_t u16;
@@ -50,7 +50,7 @@ typedef struct X11Context
 
 typedef struct X11OffScreenBuffer
 {
-    xcb_image_t *image;
+    u8 *shmaddr;
     xcb_pixmap_t pixmap;
     xcb_gcontext_t graphics_context;
 
@@ -63,22 +63,68 @@ typedef struct X11OffScreenBuffer
 
 global_variable X11OffScreenBuffer global_back_buffer;
 
+internal void draw_to_buffer(X11OffScreenBuffer *buffer, u32 blue_offset, u32 red_offset)
+{
+    u8 *row = (u8 *)buffer->memory;
+    for(u32 y = 0;
+            y < buffer->height;
+            ++y)
+    {
+        u32 *pixel = (u32 *)row;
+        for(u32 x = 0;
+                x < buffer->width;
+                ++x)
+        {
+            u8 blue = x + blue_offset;
+            u8 red = y + red_offset;
+            *pixel++ = ((red << 16) | blue);
+        }
+        row += buffer->pitch;
+    }
+
+}
+
 internal void x11_update_window(X11Context *context, X11OffScreenBuffer buffer)
 {
-     xcb_copy_area(context->connection, 
-             buffer.pixmap, 
-             context->window, buffer.graphics_context, 
-             0, 0, 0, 0,
-             buffer.width, buffer.height);
+
+#if 1
+    // NOTE(Zourt): copy data from custom buffer to the shm
+
+    u8 *src_row = (u8 *)buffer.memory;
+    u8 *dst_row = (u8 *)buffer.shmaddr;
+    for(u32 y = 0;
+            y < buffer.height;
+            ++y)
+    {
+        u32 *dest_pixel = (u32 *)dst_row;
+        u32 *src_pixel = (u32 *)src_row;
+        for(u32 x = 0;
+                x < buffer.width;
+                ++x)
+        {
+            u8 blue = x;
+            u8 red = y;
+            *dest_pixel++ = *src_pixel++;
+        }
+        dst_row += buffer.pitch;
+        src_row += buffer.pitch;
+    }
+
+    xcb_copy_area(context->connection, 
+            buffer.pixmap, 
+            context->window, buffer.graphics_context, 
+            0, 0, 0, 0,
+            buffer.width, buffer.height);
+    xcb_flush(context->connection);
+#endif
 }
 
 internal void x11_resize_back_buffer(X11Context *context, X11OffScreenBuffer *buffer, u32 width, u32 height)
 {
     int bytes_per_pixel = 4;
+
     if(buffer->memory)
     {
-        // NOTE:(zourt) for some reason this (munmap) dumps when window is resized
-        // NOTE:(zourt) if application core dumps, this may be a culprit
         munmap(buffer->memory, (buffer->width * buffer->height) * bytes_per_pixel);
     }
 
@@ -96,31 +142,43 @@ internal void x11_resize_back_buffer(X11Context *context, X11OffScreenBuffer *bu
     buffer->height = height;
 
     // NOTE(Zourt): 24 is the pixmap depth, i.e rgb each with 8 bits
+    u8 depth = 24;
+
     buffer->pixmap = xcb_generate_id(context->connection);
-    xcb_create_pixmap(context->connection, 24, buffer->pixmap, context->window, width, height);
+    xcb_create_pixmap(context->connection, depth, buffer->pixmap, context->window, width, height);
 
     buffer->graphics_context = xcb_generate_id(context->connection);
     xcb_create_gc(context->connection, buffer->graphics_context, buffer->pixmap, 0, 0);
 
 
     u8 pad = 32;
-    u8 depth = 24;
     u8 bbp = 32;
-
     buffer->pitch = width * bytes_per_pixel;
     usize image_size = buffer->pitch * height;
-    void *image_data = mmap(0,
+    buffer->memory = mmap(0,
             (width * height) * bytes_per_pixel,
             PROT_READ | PROT_WRITE,
             MAP_ANONYMOUS | MAP_PRIVATE,
             -1,
             0);
 
-    buffer->memory = image_data;
+    // buffer->image = xcb_image_create(width, height, XCB_IMAGE_FORMAT_Z_PIXMAP, pad, depth, bbp, 0, 
+    //         (xcb_image_order_t)context->setup->image_byte_order, XCB_IMAGE_ORDER_LSB_FIRST, buffer->memory, image_size, (u8 *)buffer->memory);
 
-    buffer->image = xcb_image_create(width, height, XCB_IMAGE_FORMAT_Z_PIXMAP, pad, depth, bbp, 0, 
-            (xcb_image_order_t)context->setup->image_byte_order, XCB_IMAGE_ORDER_LSB_FIRST, buffer->memory, image_size, (u8 *)buffer->memory);
+#if 1
+    xcb_shm_segment_info_t shm_info = {0};
+    shm_info.shmid = shmget(IPC_PRIVATE, (buffer->width * buffer->height * bytes_per_pixel), IPC_CREAT | 0666);
+    shm_info.shmaddr = shmat(shm_info.shmid, 0, 0);
+    shm_info.shmseg = xcb_generate_id(context->connection);
 
+    xcb_shm_attach(context->connection, shm_info.shmseg, shm_info.shmid, 0);
+    shmctl(shm_info.shmid, IPC_RMID, 0);
+
+    buffer->pixmap = xcb_generate_id(context->connection);
+    xcb_shm_create_pixmap(context->connection, buffer->pixmap, context->window, width, height, depth, shm_info.shmseg, 0);
+    buffer->shmaddr = shm_info.shmaddr;
+
+#endif
 }
 
 internal bool x11_handle_events(X11Context *context, XEvent *event)
@@ -134,8 +192,6 @@ internal bool x11_handle_events(X11Context *context, XEvent *event)
             bool is_down = (event->type == KeyPress);
             XKeyEvent *e = (XKeyEvent *)event;
             KeySym keysym = XLookupKeysym(e, 0);
-            // xcb_key_press_event_t *e = (xcb_key_press_event_t *)event;
-            // xcb_keysym_t keysym = xcb_key_press_lookup_keysym(context->ksm, e, 0);
 
             if(keysym == XK_F4 || (keysym == XK_F4 && (e->state & XCB_MOD_MASK_1)))
             {
@@ -144,7 +200,7 @@ internal bool x11_handle_events(X11Context *context, XEvent *event)
         }break;
 
         
-#if 1
+        // NOTE(Zourt): does this need to be here
         case(Expose):
         {
             x11_update_window(context, global_back_buffer);
@@ -158,6 +214,26 @@ internal bool x11_handle_events(X11Context *context, XEvent *event)
             printf("(width: %i, height: %i)\n", width, height);
 
             x11_resize_back_buffer(context, &global_back_buffer,  width, height);
+        }break;
+
+#if 0
+        case(ConfigureNotify):
+        {
+
+            XWindowAttributes wa = {0};
+            XGetWindowAttributes(context->display, context->window, &wa);
+            // printf("(original width: %i, original height: %i)\n", wa.width, wa.height);
+
+            XConfigureEvent *e = (XConfigureEvent *)event;
+            if(e->width != wa.width || e->height != wa.height)
+            {
+                u32 width = e->width;
+                u32 height = e->height;
+                // printf("(width: %i, height: %i)\n", width, height);
+
+                x11_resize_back_buffer(context, &global_back_buffer,  width, height);
+            }
+
         }break;
 #endif
     }
@@ -206,7 +282,7 @@ int main(int argc, char **argv)
             u32 mask = XCB_CW_BACK_PIXEL | XCB_CW_EVENT_MASK;
             u32 values[2] = 
             { 
-                screen->black_pixel, //0x0000ffff,
+                screen->black_pixel, 
                 0
                     | XCB_EVENT_MASK_POINTER_MOTION
                     | XCB_EVENT_MASK_KEY_PRESS
@@ -215,15 +291,19 @@ int main(int argc, char **argv)
                     | XCB_EVENT_MASK_BUTTON_RELEASE
                     | XCB_EVENT_MASK_RESIZE_REDIRECT
                     | XCB_EVENT_MASK_EXPOSURE
-                    ,
             };
 
             #define SCREEN_WIDTH 960
             #define SCREEN_HEIGHT 540
+            // #define SCREEN_WIDTH 1920
+            // #define SCREEN_HEIGHT 1080
 
             xcb_create_window(context.connection, XCB_COPY_FROM_PARENT, 
                     context.window, screen->root, 0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, 0, 
                     XCB_WINDOW_CLASS_INPUT_OUTPUT, screen->root_visual, mask, values);
+
+            uint32_t value[] = { XCB_STACK_MODE_ABOVE };
+            xcb_configure_window(context.connection, context.window, XCB_CONFIG_WINDOW_STACK_MODE, value);
 
 
             const char *title = "Game";
@@ -240,6 +320,9 @@ int main(int argc, char **argv)
             xcb_map_window(context.connection, context.window);
             xcb_flush(context.connection);
 
+            x11_resize_back_buffer(&context, &global_back_buffer,  SCREEN_WIDTH, SCREEN_HEIGHT);
+            u32 blue_offset = 0;
+            u32 red_offset = 0;
             global_running = 1;
             while(global_running)
             {
@@ -251,6 +334,15 @@ int main(int argc, char **argv)
                     {
                         global_running = 0;
                     }
+                }
+
+                draw_to_buffer(&global_back_buffer, blue_offset, red_offset);
+                x11_update_window(&context, global_back_buffer);
+                blue_offset += 1;
+
+                if((blue_offset%2) == 0)
+                {
+                    red_offset += 1;
                 }
             }
         }

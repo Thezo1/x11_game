@@ -19,12 +19,11 @@
 #include<X11/keysym.h>
 #include<X11/extensions/XShm.h>
 
+#include<libudev.h>
+
 #include<unistd.h>
 #include<fcntl.h>
 #include<dirent.h>
-
-#include<alsa/asoundlib.h>
-#include<linux/input.h>
 
 #include<GL/glx.h>
 
@@ -48,6 +47,7 @@ typedef bool b32;
 #define internal static
 
 #define X11_MAX_CONTROLLER 4
+#define BLOCK_SIZE 512
 
 global_variable b32 global_running;
 
@@ -496,6 +496,54 @@ int main(int argc, char **argv)
                     }
                 }
 
+                struct udev *udev;
+                struct udev_device *dev;
+                struct udev_enumerate *enumerate;
+                struct udev_list_entry *devices, *dev_list_entry;
+
+                udev = udev_new();
+                if (!udev)
+                {
+                    fprintf(stderr, "Cannot create udev context.\n");
+                    return 1;
+                }
+
+                enumerate = udev_enumerate_new(udev);
+                if (!enumerate) {
+                    fprintf(stderr, "Cannot create enumerate context.\n");
+                    return 1;
+                }
+
+                udev_enumerate_add_match_subsystem(enumerate, "input");
+                udev_enumerate_scan_devices(enumerate);
+
+                devices = udev_enumerate_get_list_entry(enumerate);
+                if (!devices)
+                {
+                    fprintf(stderr, "Failed to get device list.\n");
+                    return 1;
+                }
+
+                udev_list_entry_foreach(dev_list_entry, devices)
+                {
+                    const char *name, *tmp;
+
+                    name = udev_list_entry_get_name(dev_list_entry);
+                    dev = udev_device_new_from_syspath(udev, name);
+                    name = udev_device_get_sysattr_value(dev, "name");
+
+                    printf("I: NAME=%s\n", name);
+                    printf("I: DEVPATH=%s\n", udev_device_get_devnode(dev));
+                    printf("I: SYSPATH=%s\n\n", udev_device_get_sysname(dev));
+                    udev_device_unref(dev);
+                }
+                /* free enumerate */
+                udev_enumerate_unref(enumerate);
+                /* free udev */
+                udev_unref(udev);
+
+
+
                 // for(u32 controller_index = 0;
                 //         controller_index < X11_MAX_CONTROLLER;
                 //         ++controller_index)
@@ -509,6 +557,7 @@ int main(int argc, char **argv)
                 draw_to_buffer(&global_back_buffer, blue_offset, red_offset);
                 x11_update_window(&context, global_back_buffer);
                 blue_offset += 1;
+                global_running =0;
             }
         }
         else

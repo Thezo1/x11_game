@@ -1,7 +1,6 @@
-// NOTE(Zourt): Using xlib for events because xcb events has a bug or it's not working how I expect, I don't know
-// TODO(Zourt): Input, Don't have a controller now
-// NOTE(Zourt): alsa does not allow mulltiple application to access the audio card (SDL be looking sexy right now)
-// TODO(Zourt): I do not recommend using xcb. Only if you want hair pulling
+// NOTE: alsa does not allow mulltiple application to access the audio card (SDL be looking sexy right now)
+// TODO: Implement Logging
+// TODO: Manually map gamepad Key bindings on a file
 
 #include<stdio.h>
 #include<stdlib.h>
@@ -20,6 +19,7 @@
 #include<X11/extensions/XShm.h>
 
 #include<libudev.h>
+#include<linux/input.h>
 
 #include<unistd.h>
 #include<fcntl.h>
@@ -47,7 +47,8 @@ typedef bool b32;
 #define internal static
 
 #define X11_MAX_CONTROLLER 4
-#define BLOCK_SIZE 512
+#define DEV_INPUT_EVENT "/dev/input/event"
+
 
 global_variable b32 global_running;
 
@@ -75,6 +76,13 @@ typedef struct X11OffScreenBuffer
 
 }X11OffScreenBuffer;
 
+typedef struct X11Controller
+{
+    char path[100];
+    int fd;
+}X11Controller;
+
+X11Controller *controller_handles[X11_MAX_CONTROLLER];
 global_variable X11OffScreenBuffer global_back_buffer;
 
 internal void draw_to_buffer(X11OffScreenBuffer *buffer, u32 blue_offset, u32 red_offset)
@@ -382,9 +390,113 @@ void x11_init_opengl(X11Context *context)
     printf("GL Version: %s\n", glGetString(GL_VERSION));
 }
 
+int CompareStrings(const char *str1, const char *str2) {
+    while (*str1 && *str2 && *str1 == *str2) {
+        str1++;
+        str2++;
+    }
+
+    // Check if both strings have reached the null terminator at the same time (equal strings)
+    if (*str1 == *str2)
+        return 0;
+
+    // Return a positive value if str1 is lexicographically greater than str2
+    // Return a negative value if str1 is lexicographically smaller than str2
+    return (*str1 > *str2) ? 1 : -1;
+}
+
+int compareStringsLimited(const char *str1, const char *str2, int limit) {
+    int i = 0;
+    while (i < limit && str1[i] && str2[i] && str1[i] == str2[i]) {
+        i++;
+    }
+
+    // Check if both strings have reached the limit or if they have the same character at the limit
+    if (i == limit || str1[i] == str2[i])
+        return 0;
+
+    // Return a positive value if str1 is lexicographically greater than str2
+    // Return a negative value if str1 is lexicographically smaller than str2
+    return (str1[i] > str2[i]) ? 1 : -1;
+}
+
+internal u32 x11_init_controllers()
+{
+    struct udev *udev = NULL;
+    struct udev_device *dev = NULL;
+    struct udev_enumerate *enumerate = NULL;
+    struct udev_list_entry *devices = NULL;
+    struct udev_list_entry *item = NULL;
+
+    bool result = 0;
+    udev = udev_new();
+    if (!udev)
+    {
+        fprintf(stderr, "Cannot create udev context.\n");
+        return(0);
+    }
+    enumerate = udev_enumerate_new(udev);
+    if (!enumerate) {
+        fprintf(stderr, "Cannot create enumerate context.\n");
+        return(0);
+    }
+
+    udev_enumerate_add_match_subsystem(enumerate, "input");
+    udev_enumerate_add_match_property(enumerate, "ID_INPUT_JOYSTICK", "1");
+    udev_enumerate_scan_devices(enumerate);
+    devices = udev_enumerate_get_list_entry(enumerate);
+    if (!devices)
+    {
+        // TODO: logging disconnected gamepad
+        fprintf(stderr, "Failed to get device list.\n");
+        return(0);
+    }
+
+    u32 device_index = 0;
+    for(item = devices;
+        item;
+        item = udev_list_entry_get_next(item))
+    {
+        if(device_index < X11_MAX_CONTROLLER)
+        {
+            const char *name;
+
+            name = udev_list_entry_get_name(item);
+            dev = udev_device_new_from_syspath(udev, name);
+
+            const char *devpath = udev_device_get_devnode(dev);
+            if(devpath && (compareStringsLimited(devpath, DEV_INPUT_EVENT, 16) == 0))
+            {
+                // TODO: Use X11_Calloc() instead
+                controller_handles[device_index] = (X11Controller*)calloc(1, sizeof(X11Controller));
+
+                strcpy(controller_handles[device_index]->path, devpath);
+                controller_handles[device_index]->fd = open(devpath, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+                if(controller_handles[device_index]->fd < 0)
+                {
+                    return(0);
+                }
+                ++device_index;
+                result += 1;
+            }
+        }
+        else
+        {
+            // TODO: Logging Max Controllers exceeded
+            return(0);
+        }
+    }
+
+    udev_device_unref(dev);
+    udev_enumerate_unref(enumerate);
+    udev_unref(udev);
+    return(result);
+}
+
 int main(int argc, char **argv)
 {
     X11Context context = {};
+    bool controller = x11_init_controllers();
 
     context.display = XOpenDisplay(NULL);
     int *screen_number;
@@ -459,8 +571,8 @@ int main(int argc, char **argv)
 
 #define SCREEN_WIDTH 960
 #define SCREEN_HEIGHT 540
-// #define SCREEN_WIDTH 1920
-// #define SCREEN_HEIGHT 1080
+// define SCREEN_WIDTH 1920
+// define SCREEN_HEIGHT 1080
 
         context.window = XCreateWindow(context.display, root, 0, 0,
                 SCREEN_WIDTH, SCREEN_HEIGHT, 0,
@@ -484,6 +596,7 @@ int main(int argc, char **argv)
             u32 blue_offset = 0;
             u32 red_offset = 0;
             global_running = 1;
+
             while(global_running)
             {
                 while(XPending(context.display))
@@ -495,69 +608,50 @@ int main(int argc, char **argv)
                         global_running = 0;
                     }
                 }
-
-                struct udev *udev;
-                struct udev_device *dev;
-                struct udev_enumerate *enumerate;
-                struct udev_list_entry *devices, *dev_list_entry;
-
-                udev = udev_new();
-                if (!udev)
+                if(controller)
                 {
-                    fprintf(stderr, "Cannot create udev context.\n");
-                    return 1;
+                    struct input_event events[32];
+                    for(u32 controller_index = 0;
+                            controller_index < controller;
+                            ++controller_index)
+                    {
+                        struct input_absinfo abs_x;
+                        u32 fd = controller_handles[controller_index]->fd;
+                        // ioctl(fd, EVIOCGABS(ABS_X), &abs_x);
+                        // printf("%i\n", abs_x.minimum);
+                        // printf("%i\n", abs_x.maximum);
+
+                        unsigned long evbits[EV_MAX/32 + 1] = {0};
+                        ioctl(fd, EVIOCGBIT(0, sizeof(evbits)), evbits);
+
+                        usize bytes = read(fd, events, sizeof(events));
+                        if(bytes != -1)
+                        {
+                            u32 new_event_count = bytes/sizeof(struct input_event);
+                            for(int ev_idx = 0;
+                                    ev_idx < new_event_count;
+                                    ++ev_idx)
+                            {
+                                struct input_event ev = events[ev_idx];
+                                switch(ev.type)
+                                {
+                                    case EV_KEY:
+                                    {
+                                        if(ev.value == 1)
+                                        {
+                                            printf("Key Pressed: %i\n", ev.code);
+                                        }
+                                    }
+                                }
+                                
+                            }
+                        }
+                    }
                 }
-
-                enumerate = udev_enumerate_new(udev);
-                if (!enumerate) {
-                    fprintf(stderr, "Cannot create enumerate context.\n");
-                    return 1;
-                }
-
-                udev_enumerate_add_match_subsystem(enumerate, "input");
-                udev_enumerate_scan_devices(enumerate);
-
-                devices = udev_enumerate_get_list_entry(enumerate);
-                if (!devices)
-                {
-                    fprintf(stderr, "Failed to get device list.\n");
-                    return 1;
-                }
-
-                udev_list_entry_foreach(dev_list_entry, devices)
-                {
-                    const char *name, *tmp;
-
-                    name = udev_list_entry_get_name(dev_list_entry);
-                    dev = udev_device_new_from_syspath(udev, name);
-                    name = udev_device_get_sysattr_value(dev, "name");
-
-                    printf("I: NAME=%s\n", name);
-                    printf("I: DEVPATH=%s\n", udev_device_get_devnode(dev));
-                    printf("I: SYSPATH=%s\n\n", udev_device_get_sysname(dev));
-                    udev_device_unref(dev);
-                }
-                /* free enumerate */
-                udev_enumerate_unref(enumerate);
-                /* free udev */
-                udev_unref(udev);
-
-
-
-                // for(u32 controller_index = 0;
-                //         controller_index < X11_MAX_CONTROLLER;
-                //         ++controller_index)
-                // {
-                //     u32 max_device_path_length = 15;
-                //     char device_path[max_device_path_length];
-                //     snprintf(device_path, sizeof(device_path), "/dev/input/js%d", controller_index);
-
-                // }
 
                 draw_to_buffer(&global_back_buffer, blue_offset, red_offset);
                 x11_update_window(&context, global_back_buffer);
                 blue_offset += 1;
-                global_running =0;
             }
         }
         else

@@ -5,6 +5,6 @@ set -xe
 mkdir -p ./build
 pushd ./build
 
-clang -g -Werror ../code/x11_game.c -o x11 -lX11 -lXext -lGL -ludev
+clang -g -Werror ../code/x11_game.c -o x11 -lX11 -lXext -lGL -ludev -DGAME_DEBUG=1
 
 popd

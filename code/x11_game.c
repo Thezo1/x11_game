@@ -1,22 +1,26 @@
-// NOTE: alsa does not allow mulltiple application to access the audio card (SDL be looking sexy right now)
-// TODO: Implement Logging
-// TODO: Manually map gamepad Key bindings on a file
+// NOTE: This is just for learning purposes, I'd probably use SDL for a serious project or maybe get used to X11 and enjoy using it
+// NOTE: alsa does not allow mulltiple application to access the audio card
+// NOTE: GamePad input code is shit right now, I don't know, make it better later, this is just to get things working now, add support for haptics and all
+// NOTE: I don't know what possessed me to use FALSE as 0 and TRUE as 1
+/* TODO: 
+ *
+ * - Manually map gamepad Key bindings from a file.
+ * provide a GUI for said mapping
+ * - HotPlugging
+ * - Haptics
+ * - Maybe do our own keyboard and mouse instead of xlib's
+ * - Implement Logging
+ * - Vulkan?
+*/
 
 #include<stdio.h>
 #include<stdlib.h>
 #include<string.h>
-#include<stdint.h>
 #include<stdbool.h>
 
 #include<sys/mman.h>
 #include<sys/shm.h>
 
-#include<X11/Xlib.h>
-#include<X11/Xutil.h>
-#include<X11/Xatom.h>
-#include<X11/Xlib-xcb.h>
-#include<X11/keysym.h>
-#include<X11/extensions/XShm.h>
 
 #include<libudev.h>
 #include<linux/input.h>
@@ -26,64 +30,44 @@
 #include<dirent.h>
 
 #include<GL/glx.h>
-
-typedef uint8_t u8;
-typedef uint16_t u16;
-typedef uint32_t u32;
-typedef uint64_t u64;
-
-typedef int8_t i8;
-typedef int16_t i16;
-typedef int32_t i32;
-typedef int64_t i64;
-
-typedef size_t usize;
-typedef float f32;
-typedef double f64;
-typedef bool b32;
-
-#define global_variable static
-#define local_persist static
-#define internal static
-
-#define X11_MAX_CONTROLLER 4
-#define DEV_INPUT_EVENT "/dev/input/event"
+#include "x11_game.h"
 
 
 global_variable b32 global_running;
-
-typedef struct X11Context
-{
-    Display *display;
-    Window window;
-
-    int default_screen;
-    XVisualInfo *visual_info;
-    Atom wm_delete_window;
-} X11Context;
-
-typedef struct X11OffScreenBuffer
-{
-    XImage *image;
-    XShmSegmentInfo shminfo;
-
-    GC graphics_context;
-    
-    u32 width;
-    u32 height;
-    u32 pitch;
-    void *memory;
-
-}X11OffScreenBuffer;
-
-typedef struct X11Controller
-{
-    char path[100];
-    int fd;
-}X11Controller;
-
 X11Controller *controller_handles[X11_MAX_CONTROLLER];
 global_variable X11OffScreenBuffer global_back_buffer;
+
+static X11KeyBindings default_bindings[X11_ACTION_COUNT] = 
+{
+    [X11_LEFT_STICK_UP] = {.type = EV_ABS, .code = 1, .is_positive = 1},
+    [X11_LEFT_STICK_DOWN] = {.type = EV_ABS, .code = 1, .is_positive = 1},
+    [X11_LEFT_STICK_LEFT] = {.type = EV_ABS, .code = 0, .is_positive = 1},
+    [X11_LEFT_STICK_RIGHT] = {.type = EV_ABS, .code = 0, .is_positive = 1},
+
+    [X11_DPAD_UP] = {.type = EV_ABS, .code = 17, .is_positive = 0},
+    [X11_DPAD_DOWN] = {.type = EV_ABS, .code = 17, .is_positive = 1},
+    [X11_DPAD_LEFT] = {.type = EV_ABS, .code = 16, .is_positive = 0},
+    [X11_DPAD_RIGHT] = {.type = EV_ABS, .code = 16, .is_positive = 1},
+
+    [X11_RIGHT_STICK_UP] = {.type = EV_ABS, .code = 5, .is_positive = 1},
+    [X11_RIGHT_STICK_DOWN] = {.type = EV_ABS, .code = 5, .is_positive = 1},
+    [X11_RIGHT_STICK_LEFT] = {.type = EV_ABS, .code = 3, .is_positive = 1},
+    [X11_RIGHT_STICK_RIGHT] = {.type = EV_ABS, .code = 3, .is_positive = 1},
+
+    [X11_LEFT_SHOULDER] = {.type = EV_KEY, .code = 292, .is_positive = 1},
+    [X11_RIGHT_SHOULDER] = {.type = EV_KEY, .code = 293, .is_positive = 1},
+    [X11_LEFT_TRIGGER] = {.type = EV_KEY, .code = 294, .is_positive = 1},
+    [X11_RIGHT_TRIGGER] = {.type = EV_KEY, .code = 295, .is_positive = 1},
+
+    [X11_BUTTON_A] = {.type = EV_KEY, .code = 290, .is_positive = 1},
+    [X11_BUTTON_B] = {.type = EV_KEY, .code = 289, .is_positive = 1},
+    [X11_BUTTON_X] = {.type = EV_KEY, .code = 291, .is_positive = 1},
+    [X11_BUTTON_Y] = {.type = EV_KEY, .code = 288, .is_positive = 1},
+
+    [X11_START] = {.type = EV_KEY, .code = 297, .is_positive = 1},
+    [X11_BACK] = {.type = EV_KEY, .code = 296, .is_positive = 1},
+};
+
 
 internal void draw_to_buffer(X11OffScreenBuffer *buffer, u32 blue_offset, u32 red_offset)
 {
@@ -121,8 +105,6 @@ internal void x11_update_window(X11Context *context, X11OffScreenBuffer buffer)
                 x < buffer.width;
                 ++x)
         {
-            u8 blue = x;
-            u8 red = y;
             *dest_pixel++ = *src_pixel++;
         }
         dst_row += buffer.pitch;
@@ -206,7 +188,6 @@ internal void x11_update_window(X11Context *context, X11OffScreenBuffer buffer)
 internal void x11_resize_back_buffer(X11Context *context, X11OffScreenBuffer *buffer, u32 width, u32 height)
 {
     int bytes_per_pixel = 4;
-    int bits_per_pixel = 32;
     if(buffer->memory)
     {
         munmap(buffer->memory, (buffer->width * buffer->height) * bytes_per_pixel);
@@ -223,7 +204,6 @@ internal void x11_resize_back_buffer(X11Context *context, X11OffScreenBuffer *bu
     buffer->height = height;
 
     buffer->pitch = width * bytes_per_pixel;
-    usize image_size = buffer->pitch * height;
     buffer->memory = mmap(0,
             (width * height) * bytes_per_pixel,
             PROT_READ | PROT_WRITE,
@@ -247,7 +227,7 @@ internal bool x11_handle_events(X11Context *context, XEvent *event)
         case(KeyPress):
         case(KeyRelease):
         {
-            bool is_down = (event->type == KeyPress);
+            // bool is_down = (event->type == KeyPress);
             XKeyEvent *e = (XKeyEvent *)event;
             KeySym keysym = XLookupKeysym(e, 0);
 
@@ -303,16 +283,6 @@ internal bool x11_handle_events(X11Context *context, XEvent *event)
 #endif
     }
     return should_quit;
-}
-
-internal int string_length(char *string)
-{
-    int count = 0;
-    while(*string++)
-    {
-        count ++;
-    }
-    return(count);
 }
 
 #if 0
@@ -378,7 +348,7 @@ internal void x11_init_audio()
 }
 #endif
 
-void x11_init_opengl(X11Context *context)
+internal void x11_init_opengl(X11Context *context)
 {
     bool direct = 1;
     GLXContext gl_context = glXCreateContext(context->display, context->visual_info, NULL, direct);
@@ -390,7 +360,7 @@ void x11_init_opengl(X11Context *context)
     printf("GL Version: %s\n", glGetString(GL_VERSION));
 }
 
-int CompareStrings(const char *str1, const char *str2) {
+internal inline int x11_strcmp(const char *str1, const char *str2) {
     while (*str1 && *str2 && *str1 == *str2) {
         str1++;
         str2++;
@@ -405,7 +375,7 @@ int CompareStrings(const char *str1, const char *str2) {
     return (*str1 > *str2) ? 1 : -1;
 }
 
-int compareStringsLimited(const char *str1, const char *str2, int limit) {
+internal inline int x11_strcmp_to(const char *str1, const char *str2, int limit) {
     int i = 0;
     while (i < limit && str1[i] && str2[i] && str1[i] == str2[i]) {
         i++;
@@ -420,21 +390,24 @@ int compareStringsLimited(const char *str1, const char *str2, int limit) {
     return (str1[i] > str2[i]) ? 1 : -1;
 }
 
-internal u32 x11_init_controllers()
+internal inline int string_length(char *string)
 {
-    struct udev *udev = NULL;
+    int count = 0;
+    while(*string++)
+    {
+        count ++;
+    }
+    return(count);
+}
+
+internal i32 x11_scan_controllers(struct udev *udev)
+{
+    i32 result = 0;
     struct udev_device *dev = NULL;
     struct udev_enumerate *enumerate = NULL;
     struct udev_list_entry *devices = NULL;
     struct udev_list_entry *item = NULL;
 
-    bool result = 0;
-    udev = udev_new();
-    if (!udev)
-    {
-        fprintf(stderr, "Cannot create udev context.\n");
-        return(0);
-    }
     enumerate = udev_enumerate_new(udev);
     if (!enumerate) {
         fprintf(stderr, "Cannot create enumerate context.\n");
@@ -465,13 +438,15 @@ internal u32 x11_init_controllers()
             dev = udev_device_new_from_syspath(udev, name);
 
             const char *devpath = udev_device_get_devnode(dev);
-            if(devpath && (compareStringsLimited(devpath, DEV_INPUT_EVENT, 16) == 0))
+            if(devpath && (x11_strcmp_to(devpath, DEV_INPUT_EVENT, 16) == 0))
             {
                 // TODO: Use X11_Calloc() instead
                 controller_handles[device_index] = (X11Controller*)calloc(1, sizeof(X11Controller));
 
                 strcpy(controller_handles[device_index]->path, devpath);
                 controller_handles[device_index]->fd = open(devpath, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+                fcntl(controller_handles[device_index]->fd, F_SETFL, O_NONBLOCK);
+
                 if(controller_handles[device_index]->fd < 0)
                 {
                     return(0);
@@ -487,19 +462,52 @@ internal u32 x11_init_controllers()
         }
     }
 
-    udev_device_unref(dev);
-    udev_enumerate_unref(enumerate);
-    udev_unref(udev);
     return(result);
+}
+
+b32 x11_udev_has_event(struct udev_monitor *udev_monitor)
+{
+    int fd = udev_monitor_get_fd(udev_monitor);;
+
+    struct timeval tv;
+
+    fd_set fds;
+
+    tv.tv_sec = 0;
+    tv.tv_usec = 0;
+
+    FD_ZERO(&fds);
+    FD_SET(fd, &fds);
+
+    int ret = select(fd+1, &fds, NULL, NULL, &tv);
+
+    return(ret > 0 && FD_ISSET(fd, &fds));
 }
 
 int main(int argc, char **argv)
 {
     X11Context context = {};
-    bool controller = x11_init_controllers();
+    struct udev *udev = NULL;
+    struct udev_monitor *udev_monitor = NULL;
+
+    udev = udev_new();
+    if (!udev)
+    {
+        fprintf(stderr, "Cannot create udev context.\n");
+        return(-1);
+    }
+    udev_monitor = udev_monitor_new_from_netlink(udev, "udev");
+    if (!udev_monitor)
+    {
+        fprintf(stderr, "Cannot create udev monitor.\n");
+        return(-1);
+    }
+
+    u8 num_controllers = x11_scan_controllers(udev);
+    udev_monitor_filter_add_match_subsystem_devtype(udev_monitor, "input", NULL);
+    udev_monitor_enable_receiving(udev_monitor);
 
     context.display = XOpenDisplay(NULL);
-    int *screen_number;
 
     if(context.display)
     {
@@ -534,6 +542,10 @@ int main(int argc, char **argv)
 
 #endif
 
+        int root = DefaultRootWindow(context.display);
+        context.default_screen = DefaultScreen(context.display);
+
+#if 0
         GLint gl_attribs[] = 
         {
             GLX_RGBA,
@@ -548,15 +560,25 @@ int main(int argc, char **argv)
             None
         };
 
-        int root = DefaultRootWindow(context.display);
-        context.default_screen = DefaultScreen(context.display);
-
         context.visual_info = glXChooseVisual(context.display, context.default_screen, gl_attribs);
         if(!context.visual_info)
         {
             fprintf(stderr, "Could not choose a visual");
         }
+#else
+        int screen_bit_depth = 24;
 
+        XVisualInfo visual_info = {};
+        if(!XMatchVisualInfo(context.display, context.default_screen, screen_bit_depth, TrueColor, &visual_info))
+        {
+            printf("No Matching visual info found\n");
+            exit(1);
+        }
+        else
+        {
+            context.visual_info = &visual_info;
+        }
+#endif
         XSetWindowAttributes window_attribute;
         window_attribute.backing_pixel = 0;
         window_attribute.colormap = XCreateColormap(context.display, root, context.visual_info->visual, AllocNone);
@@ -571,8 +593,8 @@ int main(int argc, char **argv)
 
 #define SCREEN_WIDTH 960
 #define SCREEN_HEIGHT 540
-// define SCREEN_WIDTH 1920
-// define SCREEN_HEIGHT 1080
+// #define SCREEN_WIDTH 1920
+// #define SCREEN_HEIGHT 1080
 
         context.window = XCreateWindow(context.display, root, 0, 0,
                 SCREEN_WIDTH, SCREEN_HEIGHT, 0,
@@ -588,6 +610,7 @@ int main(int argc, char **argv)
 
             XClearWindow(context.display, context.window);
             XMapWindow(context.display, context.window);
+
             global_back_buffer.graphics_context = XDefaultGC(context.display, context.default_screen);
 
             XFlush(context.display);
@@ -597,8 +620,75 @@ int main(int argc, char **argv)
             u32 red_offset = 0;
             global_running = 1;
 
+            X11KeyBindings *bindings = default_bindings;
             while(global_running)
             {
+                while(x11_udev_has_event(udev_monitor))
+                {
+                    struct udev_device *dev = NULL;
+                    dev = udev_monitor_receive_device(udev_monitor);
+                    if (dev)
+                    {
+                        const char *action = udev_device_get_action(dev);
+                        if(action)
+                        {
+                            if(x11_strcmp(action, "add") == 0)
+                            {
+                                const char *devpath = udev_device_get_devnode(dev);
+                                if(devpath && x11_strcmp_to(devpath, DEV_INPUT_EVENT, 16) == 0)
+                                {
+                                    for(int array_index = 0;
+                                            array_index < X11_MAX_CONTROLLER;
+                                            ++array_index)
+                                    {
+                                        if(!controller_handles[array_index])
+                                        {
+
+                                            controller_handles[array_index] = (X11Controller*)calloc(1, sizeof(X11Controller));
+                                            strcpy(controller_handles[array_index]->path, devpath);
+                                            controller_handles[array_index]->fd = open(devpath, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+                                            fcntl(controller_handles[array_index]->fd, F_SETFL, O_NONBLOCK);
+                                            num_controllers += 1;
+                                            printf("%s added\n", devpath);
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            else if(x11_strcmp(action, "remove") == 0)
+                            {
+                                const char *devpath = udev_device_get_devnode(dev);
+                                if(devpath && x11_strcmp_to(devpath, DEV_INPUT_EVENT, 16) == 0)
+                                {
+                                    for(int array_index = 0;
+                                            array_index < X11_MAX_CONTROLLER;
+                                            ++array_index)
+                                    {
+                                        if(controller_handles[array_index])
+                                        {
+                                            if(x11_strcmp(devpath, controller_handles[array_index]->path) == 0)
+                                            {
+                                                close(controller_handles[array_index]->fd);
+                                                free(controller_handles[array_index]);
+                                                printf("%s removed\n", devpath);
+                                                num_controllers -= 1;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        /* free dev */
+                        udev_device_unref(dev);
+                    }
+                    else
+                    {
+                        break;
+                    }
+                }
+
                 while(XPending(context.display))
                 {
                     XEvent event;
@@ -608,43 +698,34 @@ int main(int argc, char **argv)
                         global_running = 0;
                     }
                 }
-                if(controller)
+
+                if(num_controllers)
                 {
                     struct input_event events[32];
                     for(u32 controller_index = 0;
-                            controller_index < controller;
+                            controller_index < num_controllers;
                             ++controller_index)
                     {
-                        struct input_absinfo abs_x;
                         u32 fd = controller_handles[controller_index]->fd;
-                        // ioctl(fd, EVIOCGABS(ABS_X), &abs_x);
-                        // printf("%i\n", abs_x.minimum);
-                        // printf("%i\n", abs_x.maximum);
 
-                        unsigned long evbits[EV_MAX/32 + 1] = {0};
-                        ioctl(fd, EVIOCGBIT(0, sizeof(evbits)), evbits);
+                        unsigned long keyinfo[NBITS(KEY_MAX)];
+                        ssize bytes = read(fd, events, sizeof(events));
 
-                        usize bytes = read(fd, events, sizeof(events));
-                        if(bytes != -1)
+                        if(ioctl(fd, EVIOCGKEY(sizeof(keyinfo)), keyinfo) >= 0)
                         {
-                            u32 new_event_count = bytes/sizeof(struct input_event);
-                            for(int ev_idx = 0;
-                                    ev_idx < new_event_count;
-                                    ++ev_idx)
+                            for(u32 i = 0;
+                                    i < KEY_MAX;
+                                    ++i)
                             {
-                                struct input_event ev = events[ev_idx];
-                                switch(ev.type)
+                                const u8 value = test_bit(i, keyinfo) ? 1 : 0;
+                                if(value && (i == bindings[X11_BUTTON_A].code))
                                 {
-                                    case EV_KEY:
-                                    {
-                                        if(ev.value == 1)
-                                        {
-                                            printf("Key Pressed: %i\n", ev.code);
-                                        }
-                                    }
+                                    red_offset += 2;
                                 }
-                                
                             }
+                        }
+                        else
+                        {
                         }
                     }
                 }
